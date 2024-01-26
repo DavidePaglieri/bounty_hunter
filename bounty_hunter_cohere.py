@@ -142,9 +142,7 @@ def get_inps(model, data_iterable, args, dev, nsamples=None):
 def visualize(model, dataloader, args, device):
     print("\nSaving visualizations ...")
 
-    inps, forward_args = get_inps(
-        model, dataloader, args, dev="cpu" if args.offload_activations else device
-    )
+    inps, forward_args = get_inps(model, dataloader, args, device)
     outs = torch.zeros_like(inps)
 
     use_cache = model.config.use_cache
@@ -253,57 +251,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "model_path",
         type=str,
-        help="path to llama model to load, as in LlamaForCausalLM.from_pretrained()",
-    )
-    parser.add_argument(
-        "dataset",
-        type=str,
-        default="none",
-        help="Dataset name [c4, pajama, refinedweb, none, etc.] or path to data where to extract calibration data from.",
-    )
-    parser.add_argument(
-        "--custom_data_path",
-        type=str,
-        default=None,
-        help="Path to load if specified. Deprecated",
+        help="path to model to load",
     )
     parser.add_argument(
         "--load", type=str, default=None, help="Path to load quantized statistics."
     )
-
     parser.add_argument(
         "--nsamples", type=int, default=128, help="Number of calibration data samples."
-    )
-    parser.add_argument(
-        "--outlier_threshold",
-        type=float,
-        default=float("inf"),
-        help="relative threshold for outliers; higher threshold = more outliers.",
-    )
-    parser.add_argument(
-        "--simplified_outliers",
-        action="store_true",
-        help="do not perform leave-one-out evaluation when detecting outliers; works faster, but generally worse in perplexity",
-    )
-    parser.add_argument(
-        "--wandb", action="store_true", help="Whether to use wandb or store locally."
-    )
-    parser.add_argument(
-        "--skip_out_loss",
-        action="store_true",
-        help="Whether to skip computation of out loss.",
-    )
-    parser.add_argument(
-        "--offload_activations",
-        action="store_true",
-        help="Offload activations to RAM to save GPU memory.",
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="auto",
-        choices=["auto", "float16", "float32"],
-        help="dtype to load the model.",
     )
 
     args = parser.parse_args()
@@ -357,14 +311,14 @@ if __name__ == "__main__":
         ):
             token_list.append(tokens_transformers[i : i + count].unsqueeze(0))
 
-        nsamples = len(token_list)
+        args.nsamples = len(token_list)
         torch.save(token_list, f"./tokens.pth")
 
-        model = get_model(args.model_path, args.load, args.dtype).train(False)
+        model = get_model(args.model_path, args.load).train(False)
 
         dataloader = get_loaders(
             "./tokens.pth",
-            nsamples=nsamples,
+            nsamples=args.nsamples,
             seed=42,
             model_path=args.model_path,
         )
