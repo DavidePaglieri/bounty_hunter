@@ -6,4 +6,4 @@ cd bounty_hunter
 export MODEL_PATH=/scratch0/davide/llama-2-7b-hf
 
 # Run
-python3 bounty_hunter_cohere.py $MODEL_PATH
+python3 bounty_hunter.py $MODEL_PATH
