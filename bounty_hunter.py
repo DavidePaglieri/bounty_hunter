@@ -175,9 +175,9 @@ def visualize(model, dataloader, args, device):
             subset = {n: all_sublayers[n] for n in names}
             vis_handlers = {}
             for sublayer_name in subset:
-                if sublayer_name == "self_attn.out_proj" or sublayer_name == "fc2":
+                if sublayer_name == "self_attn.out_proj" or sublayer_name == "mlp":
                     vis_handlers[sublayer_name] = Vis(subset[sublayer_name])
-                if sublayer_name == "fc2":
+                if sublayer_name == "mlp":
                     vis_handlers[sublayer_name] = Vis(subset[sublayer_name])
 
             def save_output(name):
@@ -188,13 +188,13 @@ def visualize(model, dataloader, args, device):
 
             vis_handles = []
             for sublayer_name in subset:
-                if sublayer_name == "self_attn.out_proj" or sublayer_name == "fc2":
+                if sublayer_name == "self_attn.out_proj" or sublayer_name == "mlp":
                     vis_handles.append(
                         subset[sublayer_name].register_forward_hook(
                             save_output(sublayer_name)
                         )
                     )
-                if sublayer_name == "fc2":
+                if sublayer_name == "mlp":
                     vis_handles.append(
                         subset[sublayer_name].register_forward_hook(
                             save_output(sublayer_name)
@@ -219,12 +219,12 @@ def visualize(model, dataloader, args, device):
                         ),
                         0,
                     )
-                if sublayer_name == "fc2":
+                if sublayer_name == "mlp":
                     vis_handlers[sublayer_name].normalize_output()
                     output_mlp_down_proj = torch.cat(
                         (
                             output_mlp_down_proj,
-                            vis_handlers["fc2"].output.unsqueeze(0).to("cpu"),
+                            vis_handlers["mlp"].output.unsqueeze(0).to("cpu"),
                         ),
                         0,
                     )
