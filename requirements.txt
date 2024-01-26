@@ -1,0 +1,7 @@
+safetensors==0.3.0
+datasets==2.10.1
+sentencepiece==0.1.97
+torch==2.1
+numpy==1.22.3
+einops==0.6.1
+transformers==4.34
