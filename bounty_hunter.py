@@ -3,21 +3,12 @@ import time
 
 import torch
 import torch.nn as nn
-from tqdm import trange
 from transformers import AutoTokenizer
-import pickle
-
 from datautils import get_loaders
-from modelutils import (
-    FALCON_TYPES,
-    find_sublayers,
-    get_layers,
-    get_lm_logits,
-    get_model,
-    get_model_head,
-    get_sequential_groups,
-)
-from spqr_engine import SPQRUtil
+
+from modelutils import get_model
+from models import *
+from utils import *
 
 
 class Vis:
@@ -25,8 +16,8 @@ class Vis:
 
     def __init__(self, layer):
         self.dev = layer.weight.device
-        self.columns = layer.weight.data.shape[1]
-        self.output = torch.zeros((2048, 4096), device=self.dev)
+        self.columns = layer.weight.data.shape[0]
+        self.output = torch.zeros((2048, self.columns), device=self.dev)
         self.nsamples = 0
 
     def normalize_output(self):
@@ -37,79 +28,55 @@ class Vis:
         self.output += out
         self.nsamples += 1
 
-
-try:
-    import safetensors  # noqa: F401
-
-    has_safetensors = True
-except ModuleNotFoundError:
-    has_safetensors = False
-
-
 @torch.no_grad()
-def get_inps(model, data_iterable, args, dev, nsamples=None):
-    """mocks model launch to collect inputs to the first model layer"""
-    # print("catching inputs from data", flush=True)
+def get_inputs(model, data_iterable, dev):    
+    
+    layer_inputs = []
+    attention_masks = []
+    position_ids = []
+    layer_input_kwargs = []
+    
+    class LayerHijacker(nn.Module):
+        """hijack layer's forward pass to cache data"""
 
-    layers = get_layers(model)
-
-    nsamples = nsamples or args.nsamples
-
-    if isinstance(data_iterable, torch.Tensor):
-
-        def batch_generator(testenc, seqlen, nsamples):
-            for i in range(nsamples):
-                batch = testenc[:, (i * seqlen) : ((i + 1) * seqlen)].to(dev)
-                yield batch
-
-        data_iterable = batch_generator(data_iterable, model.seqlen, nsamples)
-
-    emb = model.get_input_embeddings()
-    emb_dev = emb.weight.device
-    if emb_dev.type != "cuda":
-        emb = emb.to(dev)
-        # opt has other embeddings
-        if model.config.model_type == "opt":
-            model.model.decoder.embed_positions = (
-                model.model.decoder.embed_positions.to(dev)
-            )
-            if (
-                hasattr(model.model.decoder, "project_in")
-                and model.model.decoder.project_in
-            ):
-                model.model.decoder.project_in = model.model.decoder.project_in.to(dev)
-    dev = emb.weight.device  # now default device is the one where the embeddings are.
-    layer_dev = next(layers[0].parameters()).device
-    layers[0] = layers[0].to(dev)
-
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros(
-        (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
-    )
-
-    forward_arg_names = [
-        "attention_mask",
-    ]
-    if model.config.model_type.lower() in FALCON_TYPES:
-        forward_arg_names.append("alibi")
-
-    cache = {"i": 0, "attention_mask": None, "alibi": None}
-
-    class Catcher(nn.Module):
-        def __init__(self, module):
+        def __init__(self, m, device):
             super().__init__()
-            self.module = module
+            self.module = m
+            self.data_device = device
 
-        def forward(self, inp, **kwargs):
-            inps[cache["i"]] = inp
-            cache["i"] += 1
-            for forward_arg_name in forward_arg_names:
-                cache[forward_arg_name] = kwargs.get(forward_arg_name)
+        def forward(self, inp=None, **kwargs):
+            if inp is None:  # some models use all key-value arguments in forward pass call
+                for kwarg_name in ["hidden_states"]:
+                    if kwarg_name in kwargs:
+                        inp = kwargs[kwarg_name]
+                        break
+            layer_inputs.append(move_to_device(inp, self.data_device))
+
+            if kwargs["attention_mask"] is not None:
+                attention_masks.append(kwargs["attention_mask"].to(self.data_device))
+            else:
+                attention_masks.append(None)
+
+            pos_ids = kwargs.get("position_ids", None)
+            if pos_ids is not None:
+                position_ids.append(move_to_device(pos_ids, self.data_device))
+            one_kwargs = {}
+            for (
+                k,
+                v,
+            ) in kwargs.items():  # make sure other arguments also be captured
+                if k not in ["hidden_states", "attention_mask", "position_ids"]:
+                    one_kwargs[k] = nested_move_to_device(v, self.data_device)
+            layer_input_kwargs.append(one_kwargs)
             raise ValueError
-
-    layers[0] = Catcher(layers[0])
-    saved_num_threads = torch.get_num_threads()
-    torch.set_num_threads(min(16, saved_num_threads))
+    
+    model_class = CAUSAL_LM_MODEL_MAP[model.config.model_type.lower()]()
+    layers = get_layers(model, model_class.layers_block_name)
+    
+    cur_layer_device = get_device(layers[0])
+    
+    # get inputs for first layer
+    layers[0] = LayerHijacker(layers[0], cur_layer_device)
     for batch in data_iterable:
         try:
             if isinstance(batch, (list, tuple)):
@@ -118,45 +85,43 @@ def get_inps(model, data_iterable, args, dev, nsamples=None):
                 model(batch.to(dev))
         except ValueError:
             pass
-    torch.set_num_threads(saved_num_threads)
     layers[0] = layers[0].module
-
-    layers[0] = layers[0].to(layer_dev)
-    model.get_input_embeddings().to(emb_dev)
-    if model.config.model_type == "opt":
-        model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(
-            emb_dev
-        )
-        if (
-            hasattr(model.model.decoder, "project_in")
-            and model.model.decoder.project_in
-        ):
-            model.model.decoder.project_in = model.model.decoder.project_in.to(emb_dev)
     torch.cuda.empty_cache()
+    
+    layer_attention_mask = move_to_device(attention_masks[0], cur_layer_device)
+    additional_layer_inputs = {"attention_mask": layer_attention_mask}
+    layer_position_ids = (
+        None if not position_ids else move_to_device(position_ids[0], cur_layer_device)
+    )
+    if layer_position_ids is not None:
+        additional_layer_inputs["position_ids"] = layer_position_ids
+    for k, v in layer_input_kwargs[0].items():
+        additional_layer_inputs[k] = nested_move_to_device(v, cur_layer_device)
 
-    forward_args = {k: cache[k] for k in forward_arg_names}
-    return inps, forward_args
+    return layer_inputs, additional_layer_inputs
 
 
 @torch.no_grad()
 def visualize(model, dataloader, args, device):
     print("\nSaving visualizations ...")
 
-    inps, forward_args = get_inps(model, dataloader, args, device)
-    outs = torch.zeros_like(inps)
-
-    use_cache = model.config.use_cache
     model.config.use_cache = False
-    save = getattr(args, "save", False)
+    dtype = next(iter(model.parameters())).dtype
 
-    output_attn_o_proj = torch.empty((0, 4096), device="cpu")
-    output_mlp_down_proj = torch.empty((0, 4096), device="cpu")
-    print(model.config.model_type)
-    print(device)
+    inps, forward_args = get_inputs(model, dataloader, device)
+    outs = torch.zeros((args.nsamples, *inps[0].shape), dtype=dtype, device=device)
 
-    layers = get_layers(model)
+    output_attn_o_proj = torch.empty((0, model.config.hidden_size), device="cpu")
+    output_mlp_down_proj = torch.empty((0, model.config.hidden_size), device="cpu")
+    
+    outputs = {
+        "self_attn.o_proj": output_attn_o_proj,
+        "mlp.down_proj": output_mlp_down_proj,
+    }
+
+    model_class = CAUSAL_LM_MODEL_MAP[model.config.model_type.lower()]()    
+    layers = get_layers(model, model_class.layers_block_name)
     for i in range(len(layers)):
-        start_time = time.time()
 
         layer_dev_original = next(layers[i].parameters()).device
         if layer_dev_original.type != "cuda":
@@ -166,18 +131,13 @@ def visualize(model, dataloader, args, device):
         layer_dev = next(layers[i].parameters()).device
         all_sublayers = find_sublayers(layer)
 
-        for k, v in forward_args.items():
-            forward_args[k] = v.to(layer_dev) if isinstance(v, torch.Tensor) else v
-
         sequential = [list(all_sublayers.keys())]
 
         for names in sequential:
             subset = {n: all_sublayers[n] for n in names}
             vis_handlers = {}
             for sublayer_name in subset:
-                if sublayer_name == "self_attn.out_proj" or sublayer_name == "mlp":
-                    vis_handlers[sublayer_name] = Vis(subset[sublayer_name])
-                if sublayer_name == "mlp":
+                if sublayer_name in ["self_attn.o_proj", "mlp.down_proj"]:
                     vis_handlers[sublayer_name] = Vis(subset[sublayer_name])
 
             def save_output(name):
@@ -188,49 +148,34 @@ def visualize(model, dataloader, args, device):
 
             vis_handles = []
             for sublayer_name in subset:
-                if sublayer_name == "self_attn.out_proj" or sublayer_name == "mlp":
-                    vis_handles.append(
-                        subset[sublayer_name].register_forward_hook(
-                            save_output(sublayer_name)
-                        )
-                    )
-                if sublayer_name == "mlp":
+                if sublayer_name in ["self_attn.o_proj", "mlp.down_proj"]:
                     vis_handles.append(
                         subset[sublayer_name].register_forward_hook(
                             save_output(sublayer_name)
                         )
                     )
             for j in range(args.nsamples):
-                outs[j] = layer(inps[j].to(layer_dev).unsqueeze(0), **forward_args)[0]
+                outs[j] = layer(inps[j].to(layer_dev), **forward_args)[0]
                 outs[j].to("cpu")
             for h in vis_handles:
                 h.remove()
             torch.cuda.empty_cache()
 
             for sublayer_name in subset:
-                if sublayer_name == "self_attn.out_proj":
+                if sublayer_name in ["self_attn.o_proj", "mlp.down_proj"]:
                     vis_handlers[sublayer_name].normalize_output()
-                    output_attn_o_proj = torch.cat(
+                    outputs[sublayer_name] = torch.cat(
                         (
-                            output_attn_o_proj,
-                            vis_handlers["self_attn.out_proj"]
+                            outputs[sublayer_name],
+                            vis_handlers[sublayer_name]
                             .output.unsqueeze(0)
                             .to("cpu"),
                         ),
                         0,
                     )
-                if sublayer_name == "mlp":
-                    vis_handlers[sublayer_name].normalize_output()
-                    output_mlp_down_proj = torch.cat(
-                        (
-                            output_mlp_down_proj,
-                            vis_handlers["mlp"].output.unsqueeze(0).to("cpu"),
-                        ),
-                        0,
-                    )
 
         for j in range(args.nsamples):
-            outs_batch = layer(inps[j].to(layer_dev).unsqueeze(0), **forward_args)[0]
+            outs_batch = layer(inps[j].to(layer_dev), **forward_args)[0]
             outs[j] = outs_batch
             outs[j] = outs[j].cpu()
         del outs_batch
@@ -240,7 +185,7 @@ def visualize(model, dataloader, args, device):
         torch.cuda.empty_cache()
         inps, outs = outs, inps
 
-    return output_attn_o_proj, output_mlp_down_proj
+    return outputs["self_attn.o_proj"], outputs["mlp.down_proj"]
 
 
 if __name__ == "__main__":
@@ -263,6 +208,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(device)
 
     directory_path = "./languages"
 
@@ -315,6 +261,8 @@ if __name__ == "__main__":
         torch.save(token_list, f"./tokens.pth")
 
         model = get_model(args.model_path, args.load).train(False)
+        # Move model to device
+        model = model.to(device)
 
         dataloader = get_loaders(
             "./tokens.pth",
@@ -322,9 +270,18 @@ if __name__ == "__main__":
             seed=42,
             model_path=args.model_path,
         )
+        
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+        
+        
         output_attn_o_proj, output_mlp_down_proj = visualize(
             model, dataloader, args, device
         )
+        
+        print(f"Output attn shape: {output_attn_o_proj.shape}")
+        print(f"Output mlp shape: {output_mlp_down_proj.shape}")
 
         torch.save(output_attn_o_proj, f"./outputs/{language}_attn.pt")
         torch.save(output_mlp_down_proj, f"./outputs/{language}_mlp.pt")
