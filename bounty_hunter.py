@@ -5,7 +5,6 @@ import torch.nn as nn
 from transformers import AutoTokenizer
 from datautils import get_loaders
 
-from modelutils import get_model
 from models import *
 from utils import *
 
