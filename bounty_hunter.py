@@ -1,5 +1,4 @@
 import os
-import time
 
 import torch
 import torch.nn as nn
@@ -28,14 +27,15 @@ class Vis:
         self.output += out
         self.nsamples += 1
 
+
 @torch.no_grad()
-def get_inputs(model, data_iterable, dev):    
-    
+def get_inputs(model, data_iterable, dev):
+
     layer_inputs = []
     attention_masks = []
     position_ids = []
     layer_input_kwargs = []
-    
+
     class LayerHijacker(nn.Module):
         """hijack layer's forward pass to cache data"""
 
@@ -45,7 +45,9 @@ def get_inputs(model, data_iterable, dev):
             self.data_device = device
 
         def forward(self, inp=None, **kwargs):
-            if inp is None:  # some models use all key-value arguments in forward pass call
+            if (
+                inp is None
+            ):  # some models use all key-value arguments in forward pass call
                 for kwarg_name in ["hidden_states"]:
                     if kwarg_name in kwargs:
                         inp = kwargs[kwarg_name]
@@ -69,34 +71,35 @@ def get_inputs(model, data_iterable, dev):
                     one_kwargs[k] = nested_move_to_device(v, self.data_device)
             layer_input_kwargs.append(one_kwargs)
             raise ValueError
-    
+
     model_class = CAUSAL_LM_MODEL_MAP[model.config.model_type.lower()]()
     layers = get_layers(model, model_class.layers_block_name)
-    
+
     cur_layer_device = get_device(layers[0])
-    
+    # layers[0] = layers[0].to(dev)
+
     # get inputs for first layer
-    layers[0] = LayerHijacker(layers[0], cur_layer_device)
+    layers[0] = LayerHijacker(layers[0], dev)
     for batch in data_iterable:
         try:
             if isinstance(batch, (list, tuple)):
-                model(batch[0].to(dev))
+                model(batch[0].to(cur_layer_device))
             elif isinstance(batch, torch.Tensor):
-                model(batch.to(dev))
+                model(batch.to(cur_layer_device))
         except ValueError:
             pass
     layers[0] = layers[0].module
     torch.cuda.empty_cache()
-    
-    layer_attention_mask = move_to_device(attention_masks[0], cur_layer_device)
+
+    layer_attention_mask = move_to_device(attention_masks[0], dev)
     additional_layer_inputs = {"attention_mask": layer_attention_mask}
     layer_position_ids = (
-        None if not position_ids else move_to_device(position_ids[0], cur_layer_device)
+        None if not position_ids else move_to_device(position_ids[0], dev)
     )
     if layer_position_ids is not None:
         additional_layer_inputs["position_ids"] = layer_position_ids
     for k, v in layer_input_kwargs[0].items():
-        additional_layer_inputs[k] = nested_move_to_device(v, cur_layer_device)
+        additional_layer_inputs[k] = nested_move_to_device(v, dev)
 
     return layer_inputs, additional_layer_inputs
 
@@ -108,18 +111,19 @@ def visualize(model, dataloader, args, device):
     model.config.use_cache = False
     dtype = next(iter(model.parameters())).dtype
 
-    inps, forward_args = get_inputs(model, dataloader, device)
+    # CAN TRY TO GIVE IT CPU HERE TO OFFLOAD MEMORY!
+    inps, forward_args = get_inputs(model, dataloader, "cpu")
     outs = torch.zeros((args.nsamples, *inps[0].shape), dtype=dtype, device=device)
 
     output_attn_o_proj = torch.empty((0, model.config.hidden_size), device="cpu")
     output_mlp_down_proj = torch.empty((0, model.config.hidden_size), device="cpu")
-    
+
     outputs = {
         "self_attn.o_proj": output_attn_o_proj,
         "mlp.down_proj": output_mlp_down_proj,
     }
 
-    model_class = CAUSAL_LM_MODEL_MAP[model.config.model_type.lower()]()    
+    model_class = CAUSAL_LM_MODEL_MAP[model.config.model_type.lower()]()
     layers = get_layers(model, model_class.layers_block_name)
     for i in range(len(layers)):
 
@@ -129,6 +133,9 @@ def visualize(model, dataloader, args, device):
         else:
             layer = layers[i]
         layer_dev = next(layers[i].parameters()).device
+        for k, v in forward_args.items():
+            forward_args[k] = v.to(layer_dev) if isinstance(v, torch.Tensor) else v
+
         all_sublayers = find_sublayers(layer)
 
         sequential = [list(all_sublayers.keys())]
@@ -167,13 +174,10 @@ def visualize(model, dataloader, args, device):
                     outputs[sublayer_name] = torch.cat(
                         (
                             outputs[sublayer_name],
-                            vis_handlers[sublayer_name]
-                            .output.unsqueeze(0)
-                            .to("cpu"),
+                            vis_handlers[sublayer_name].output.unsqueeze(0).to("cpu"),
                         ),
                         0,
                     )
-
         for j in range(args.nsamples):
             outs_batch = layer(inps[j].to(layer_dev), **forward_args)[0]
             outs[j] = outs_batch
@@ -235,6 +239,8 @@ if __name__ == "__main__":
 
     # Iterate over languages
     for idx, language in enumerate(sorted_languages):
+
+        print("")
         print(f"We are using: {language}, {idx}/{len(sorted_languages)}")
 
         torch.cuda.empty_cache()
@@ -261,7 +267,6 @@ if __name__ == "__main__":
         torch.save(token_list, f"./tokens.pth")
 
         model = get_model(args.model_path, args.load).train(False)
-        # Move model to device
         model = model.to(device)
 
         dataloader = get_loaders(
@@ -270,18 +275,19 @@ if __name__ == "__main__":
             seed=42,
             model_path=args.model_path,
         )
-        
+
+        # Check availabel GPU memory
+        print(torch.cuda.mem_get_info()[0])
         torch.cuda.empty_cache()
         import gc
+
         gc.collect()
-        
-        
+
         output_attn_o_proj, output_mlp_down_proj = visualize(
             model, dataloader, args, device
         )
-        
         print(f"Output attn shape: {output_attn_o_proj.shape}")
         print(f"Output mlp shape: {output_mlp_down_proj.shape}")
 
-        torch.save(output_attn_o_proj, f"./outputs/{language}_attn.pt")
-        torch.save(output_mlp_down_proj, f"./outputs/{language}_mlp.pt")
+        torch.save(output_attn_o_proj, f"./outputs/{language.strip('.txt')}_attn.pt")
+        torch.save(output_mlp_down_proj, f"./outputs/{language.strip('.txt')}_mlp.pt")
