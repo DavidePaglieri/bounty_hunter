@@ -210,6 +210,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Get the model name from the model path. The name is the last part of the path
+    model_name = args.model_path.split("/")[-1]
+    print(f"Model name: {model_name}")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(device)
 
@@ -239,9 +243,6 @@ if __name__ == "__main__":
     # Iterate over languages
     for idx, language in enumerate(sorted_languages):
 
-        print("")
-        print(f"We are using: {language}, {idx}/{len(sorted_languages)}")
-
         torch.cuda.empty_cache()
         file_path = os.path.join(directory_path, language)
 
@@ -267,6 +268,7 @@ if __name__ == "__main__":
 
         model = get_model(args.model_path, args.load).train(False)
         model = model.to(device)
+        print(f"We are using: {language}, {idx}/{len(sorted_languages)}")
 
         dataloader = get_loaders(
             "./tokens.pth",
@@ -285,8 +287,16 @@ if __name__ == "__main__":
         output_attn_o_proj, output_mlp_down_proj = visualize(
             model, dataloader, args, device
         )
-        print(f"Output attn shape: {output_attn_o_proj.shape}")
-        print(f"Output mlp shape: {output_mlp_down_proj.shape}")
 
-        torch.save(output_attn_o_proj, f"./outputs/{language.strip('.txt')}_attn.pt")
-        torch.save(output_mlp_down_proj, f"./outputs/{language.strip('.txt')}_mlp.pt")
+        # If path doesn't exist create it: args.model_path + outputs folder
+        if not os.path.exists(f"./{model_name}_outputs"):
+            os.makedirs(f"./{model_name}_outputs")
+
+        torch.save(
+            output_attn_o_proj,
+            f"./{model_name}_outputs/{language.strip('.txt')}_attn.pt",
+        )
+        torch.save(
+            output_mlp_down_proj,
+            f"./{model_name}_outputs/{language.strip('.txt')}_mlp.pt",
+        )
