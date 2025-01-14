@@ -110,8 +110,7 @@ def visualize(model, dataloader, args, device):
     model.config.use_cache = False
     dtype = next(iter(model.parameters())).dtype
 
-    # CAN TRY TO GIVE IT CPU HERE TO OFFLOAD MEMORY!
-    inps, forward_args = get_inputs(model, dataloader, "cpu")
+    inps, forward_args = get_inputs(model, dataloader, "cuda")
     outs = torch.zeros((args.nsamples, *inps[0].shape), dtype=dtype, device=device)
 
     output_attn_o_proj = torch.empty((0, model.config.hidden_size), device="cpu")
