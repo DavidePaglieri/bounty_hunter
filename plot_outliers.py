@@ -1,9 +1,10 @@
+import argparse
+import os
 import torch
 from torch import nn
 import numpy as np
 import cv2
 import pickle
-import os
 import io
 import matplotlib
 import matplotlib.pyplot as plt
@@ -222,6 +223,7 @@ language_dict = {
     "zgh_Tfng": "Standard Moroccan Tamazight [Tfng]",
     "zsm_Latn": "Standard Malay [Latn]",
     "zul_Latn": "Zulu [Latn]",
+    "rnd_Latn": "Random punctuation [Latn]",
 }
 
 suffix_dict = {
@@ -230,10 +232,11 @@ suffix_dict = {
     "attn": "attn.o_proj",
 }
 
+
 output_dict = {
-    "opt_tensors/": "OPT 6.7B",
-    "llama_tensors/": "LLaMa-2 7B",
-    "mistral_tensors/": "Mistral 7B",
+    "opt_tensors": "OPT 6.7B",
+    "llama_tensors": "LLaMa-2 7B",
+    "mistral_tensors": "Mistral 7B",
 }
 
 cmap = matplotlib.cm.get_cmap("cet_diverging_bwr_20_95_c54")
@@ -241,80 +244,132 @@ plt.rcParams["figure.dpi"] = 300
 plt.rcParams["figure.figsize"] = (6, 4)
 plt.rcParams["axes.labelsize"] = 8
 
-colors = ["red", "blue", "green"]
-suffixes = ["attn", "mlp", "fc2"]
-
 
 def main():
-    folders = ["opt_tensors/", "llama_tensors/", "mistral_tensors/"]
-    output_folder = "combined_outputs"
+    import argparse
 
-    # Read the .jpg files in pairs of two and combine them (plot them one on top of the other)
+    parser = argparse.ArgumentParser(description="Process outliers for a given folder.")
+    parser.add_argument("folder", help="Path to the input folder (e.g. opt_tensors)")
+    args = parser.parse_args()
 
-    suffixes = suffix_dict.keys()
+    folder = args.folder.rstrip("/")
+    output_folder = f"{folder}_outliers"
+    os.makedirs(output_folder, exist_ok=True)
 
-    file_name = "eng_Latn"
+    files = list(language_dict.keys())
 
-    suffix = "_attn.pt"
-    # Read img with cv2
-    for idx_, folder in enumerate(folders):
-        print(folder)
+    folder_base = os.path.basename(folder)
+    model_label = output_dict.get(folder_base, folder_base)
 
-        tensor1 = torch.load(folder + file_name + "_attn.pt")
-        # if "opt" in folder:
-        #     tensor2 = torch.load(folder + file_name + "_fc2.pt")
-        #     suffix = "FC2"
-        # else:
-        #     tensor2 = torch.load(folder + file_name + "_mlp.pt")
-        #     suffix = "MLP"
+    for i, file_name in enumerate(files):
 
-        plt.hist(
-            tensor1.view(-1).detach().numpy(),
-            bins=1000,
-            alpha=0.5,
-            label=output_dict[folder],
-            color=colors[idx_],
-            range=(-0.75, 0.75),
-        )
-
-    plt.title(f"{language_dict[file_name]} - attn.o_proj")
-    plt.xticks(np.arange(-0.75, 1, 0.25))
-    plt.grid(True, which="both", axis="both", linestyle="--", alpha=0.5, linewidth=0.2)
-    plt.legend()
-    plt.yscale("log")
-    plt.xlabel("Value")
-    plt.ylabel("Frequency")
-    plt.savefig(f"{file_name}_attn_hist.png")
-    plt.close()
-
-    for idx_, folder in enumerate(folders):
-        print(folder)
-
+        print(f"Processing [{i+1}/{len(files)}]: {file_name}")
+        tensor_attn_path = os.path.join(folder, f"{file_name}_attn.pt")
         if "opt" in folder:
-            tensor1 = torch.load(folder + file_name + "_fc2.pt")
+            tensor_alt_path = os.path.join(folder, f"{file_name}_fc2.pt")
             suffix = "FC2"
         else:
-            tensor1 = torch.load(folder + file_name + "_mlp.pt")
+            tensor_alt_path = os.path.join(folder, f"{file_name}_mlp.pt")
             suffix = "MLP"
 
-        plt.hist(
-            tensor1.view(-1).detach().numpy(),
-            bins=1000,
-            alpha=0.5,
-            label=output_dict[folder],
-            color=colors[idx_],
-            range=(-1.5, 1.5),
-        )
+        if not os.path.isfile(tensor_attn_path) or not os.path.isfile(tensor_alt_path):
+            print(f"Missing required .pt files for {file_name}. Skipping.")
+            continue
 
-    plt.title(f"{language_dict[file_name]} - mlp")
-    plt.xticks(np.arange(-1.5, 1.75, 0.5))
-    plt.grid(True, which="both", axis="both", linestyle="--", alpha=0.5, linewidth=0.2)
-    plt.legend()
-    plt.yscale("log")
-    plt.xlabel("Activation")
-    plt.ylabel("Frequency")
-    plt.savefig(f"{file_name}_mlp_hist.png")
-    plt.close()
+        tensor1 = torch.load(tensor_attn_path)
+        tensor2 = torch.load(tensor_alt_path)
+
+        plt.clf()
+        fig, axs = plt.subplots(2, gridspec_kw={"wspace": 0, "hspace": 0})
+
+        tensors = [tensor1, tensor2]
+
+        for idx, tensor in enumerate(tensors):
+            activations = tensor.clone()
+
+            activation_values = activations.view(-1).detach().numpy()
+            activation_values_sorted = np.sort(activation_values)
+
+            # 1% percentile boundaries
+            percentile_1 = int(0.01 * len(activation_values))
+            if percentile_1 == 0 or percentile_1 >= len(activation_values):
+                continue
+            threshold_low = activation_values_sorted[percentile_1]
+            threshold_high = activation_values_sorted[-percentile_1]
+
+            activations = torch.where(
+                (activations >= threshold_low) & (activations <= threshold_high),
+                torch.tensor(0.0),
+                activations,
+            )
+
+            activations = nn.MaxPool1d(16)(activations) - nn.MaxPool1d(16)(-activations)
+            # Log-scaling
+            activations = torch.log(torch.abs(activations) + 1) * torch.sign(
+                activations
+            )
+
+            axs[idx].imshow(
+                activations.squeeze(1).numpy(),
+                cmap=cmap,
+                interpolation="nearest",
+                vmin=-3,
+                vmax=+3,
+            )
+            max_value = torch.max(tensor)
+            min_value = torch.min(tensor)
+
+            # Label in the subplot
+            name = suffix if idx == 1 else "Attn o_proj"
+            axs[idx].text(
+                115,
+                7.5,
+                f"Low 1%: {threshold_low:.2f}\nTop 1%: {threshold_high:.2f}\nMin: {min_value:.2f}\nMax: {max_value:.2f}",
+                fontsize=5,
+            )
+            axs[idx].text(
+                0,
+                2,
+                f"{name}",
+                fontsize=8,
+            )
+            axs[idx].tick_params(axis="both", which="major", labelsize=7)
+            axs[idx].set_aspect("equal")
+
+        # Title and axes
+        axs[0].set_title(f"{model_label} - {language_dict[file_name]}")
+        axs[0].set(ylabel="Layer")
+        axs[1].set(ylabel="Layer", xlabel="Hidden Dimension")
+
+        x_ticks_displayed = [0, 16, 32, 48, 64]
+        x_ticks_actual = [0, 512, 1024, 1536, 2048]
+        axs[0].set_xticks(x_ticks_displayed, x_ticks_actual)
+        axs[1].set_xticks(x_ticks_displayed, x_ticks_actual)
+
+        fig.subplots_adjust(wspace=0, hspace=0)
+        plt.tight_layout()
+
+        fig.canvas.draw()
+        width, height = fig.get_size_inches() * fig.get_dpi()
+        img_flat = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        img = img_flat.reshape(int(height), int(width), 3)
+
+        # Crop the image if needed
+        # img = np.delete(img, np.s_[1020:1286], axis=0)
+        # img = np.delete(img, np.s_[:110], axis=0)
+        # img = np.delete(img, np.s_[-110:], axis=0)
+        # img = np.delete(img, np.s_[:70], axis=1)
+        # img = np.delete(img, np.s_[-60:], axis=1)
+
+        im = Image.fromarray(img)
+
+        out_name = f"{file_name}_{model_label}.jpg"
+        out_path = os.path.join(output_folder, out_name)
+        im.save(out_path)
+
+        plt.close()
+
+    print(f"Output images are in: {output_folder}")
 
 
 if __name__ == "__main__":

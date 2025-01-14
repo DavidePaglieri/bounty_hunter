@@ -1,17 +1,11 @@
-import torch
-from torch import nn
-import numpy as np
-import cv2
-import pickle
+import argparse
 import os
-import io
+import torch
+import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib import colors
 from matplotlib.colors import LinearSegmentedColormap
-import matplotlib.gridspec as gridspec
-from PIL import Image
-
 import holoviews as hv
 
 hv.extension("matplotlib")
@@ -222,7 +216,6 @@ language_dict = {
     "zgh_Tfng": "Standard Moroccan Tamazight [Tfng]",
     "zsm_Latn": "Standard Malay [Latn]",
     "zul_Latn": "Zulu [Latn]",
-    "rnd_Latn": "Random punctuation [Latn]",
 }
 
 suffix_dict = {
@@ -231,132 +224,151 @@ suffix_dict = {
     "attn": "attn.o_proj",
 }
 
-output_dict = {
-    "opt_tensors/": "OPT 6.7B",
-    "llama_tensors/": "LLaMa-2 7B",
-    "mistral_tensors/": "Mistral 7B",
+suffix_dict = {
+    "mlp": "MLP",
+    "fc2": "FC2",
+    "attn": "attn.o_proj",
 }
 
+output_dict = {
+    "opt_tensors": "OPT 6.7B",
+    "llama_tensors": "LLaMa-2 7B",
+    "mistral_tensors": "Mistral 7B",
+}
+
+# Configure matplotlib
 cmap = matplotlib.cm.get_cmap("cet_diverging_bwr_20_95_c54")
 plt.rcParams["figure.dpi"] = 300
 plt.rcParams["figure.figsize"] = (6, 4)
 plt.rcParams["axes.labelsize"] = 8
 
+colors = ["red", "blue", "green", "purple", "orange"]  # Extend if you have more folders
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Plot histograms of .pt files from given folders."
+    )
+    parser.add_argument(
+        "folders",
+        nargs="+",
+        help="One or more folders containing the .pt files (e.g. attn.pt, mlp.pt, fc2.pt).",
+    )
+    return parser.parse_args()
+
 
 def main():
-    folders = ["opt_tensors", "llama_tensors", "mistral_tensors/"]
-    output_folder = "combined_outputs"
+    args = parse_args()
+    input_folders = args.folders
 
-    for folder in enumerate(folders):
-        # Read the .jpg files in pairs of two and combine them (plot them one on top of the other)
-        files = language_dict.keys()
-        suffixes = suffix_dict.keys()
+    # Iterate through each folder separately
+    for folder in input_folders:
+        # Normalize folder path and skip if invalid
+        folder = folder.rstrip("/")
+        if not os.path.isdir(folder):
+            print(f"Warning: '{folder}' is not a valid directory. Skipping.")
+            continue
 
-        for file_name in enumerate(files):
-            if file_name != "eng_Latn":
+        # Prepare an output folder: original folder name + '_hist'
+        out_folder = f"{folder}_hist"
+        os.makedirs(out_folder, exist_ok=True)
+
+        # Try to map folder name to a short label (or just use the folder name if not in dictionary)
+        folder_base = os.path.basename(folder)
+        legend_label = output_dict.get(folder_base, folder_base)
+
+        # Gather all *.pt files in this folder
+        pt_files = [
+            f
+            for f in os.listdir(folder)
+            if f.endswith(".pt") and os.path.isfile(os.path.join(folder, f))
+        ]
+
+        # Dictionary to group files by (lang_code, suffix)
+        # e.g. grouped_files[("eng_Latn", "attn")] = ["/path/to/eng_Latn_attn.pt", ...]
+        grouped_files = {}
+
+        for pt_file in pt_files:
+            # Check which suffix it matches and parse language code
+            if pt_file.endswith("_attn.pt"):
+                suffix = "attn"
+                lang_code = pt_file.replace("_attn.pt", "")
+            elif pt_file.endswith("_mlp.pt"):
+                suffix = "mlp"
+                lang_code = pt_file.replace("_mlp.pt", "")
+            elif pt_file.endswith("_fc2.pt"):
+                suffix = "fc2"
+                lang_code = pt_file.replace("_fc2.pt", "")
+            else:
+                # Not one of our recognized suffixes
                 continue
 
-        for i, file_name in enumerate(files):
-            print(f"{i}/{len(files)}")
-            suffix = None
-            # Read img with cv2
-            tensor1 = torch.load(folder + file_name + "_attn.pt")
-            if "opt" in folder:
-                tensor2 = torch.load(folder + file_name + "_fc2.pt")
-                suffix = "FC2"
+            full_path = os.path.join(folder, pt_file)
+            grouped_files.setdefault((lang_code, suffix), []).append(full_path)
+
+        # For each (language_code, suffix) group, plot and save a figure
+        for (lang_code, suffix), filepaths in grouped_files.items():
+            # We’ll plot multiple histograms on the same figure only if
+            # there are multiple .pt files that match the same (lang_code, suffix).
+            # But often there's just one file per group.
+            plt.figure()
+
+            # Decide on histogram range, ticks, and suffix title
+            if suffix == "attn":
+                hist_range = (-0.75, 0.75)
+                x_ticks = np.arange(-0.75, 1.0, 0.25)
+                suffix_title = suffix_dict[suffix]
+                x_label = "Value"
             else:
-                tensor2 = torch.load(folder + file_name + "_mlp.pt")
-                suffix = "MLP"
+                # mlp or fc2
+                hist_range = (-1.5, 1.5)
+                x_ticks = np.arange(-1.5, 1.75, 0.5)
+                suffix_title = suffix_dict[suffix]
+                x_label = "Activation"
 
-            plt.clf()
-            # Create two plots
-            fig, axs = plt.subplots(2, gridspec_kw={"wspace": 0, "hspace": 0})
-            # fig.suptitle(f"{language_dict[file_name]}")
-            tensors = [tensor1, tensor2]
-
-            for idx, tensor in enumerate(tensors):
-                activations = tensor.clone()
-                # Find the distribution of activations
-                activation_values = activations.view(-1).detach().numpy()
-                activation_values_sorted = sorted(activation_values)
-
-                # Calculate the thresholds for the top and bottom 1 percentile
-                percentile_1 = int(0.01 * len(activation_values))
-                threshold_low = activation_values_sorted[percentile_1]
-                threshold_high = activation_values_sorted[-percentile_1]
-
-                # Set activations to 0 that are not in the top and bottom 1 percentile
-                activations = torch.where(
-                    (activations >= threshold_low) & (activations <= threshold_high),
-                    torch.tensor(0.0),
-                    activations,
+            # Plot each .pt file in this group
+            for idx_, filepath in enumerate(filepaths):
+                tensor = torch.load(filepath)
+                # Flatten the tensor to 1D
+                data = tensor.view(-1).detach().cpu().numpy()
+                plt.hist(
+                    data,
+                    bins=1000,
+                    alpha=0.5,
+                    label=(
+                        f"{legend_label}"
+                        if len(filepaths) == 1
+                        else f"{legend_label}_{idx_}"
+                    ),
+                    color=colors[idx_ % len(colors)],
+                    range=hist_range,
                 )
 
-                activations = nn.MaxPool1d(32)(activations) - nn.MaxPool1d(32)(
-                    -activations
-                )
-                # activations *= 10
+            # If available, translate the language code to a nicer name
+            lang_title = language_dict.get(lang_code, lang_code)
+            plt.title(f"{lang_title} - {suffix_title}")
 
-                activations = torch.log(torch.abs(activations) + 1) * torch.sign(
-                    activations
-                )
+            plt.xticks(x_ticks)
+            plt.grid(
+                True,
+                which="both",
+                axis="both",
+                linestyle="--",
+                alpha=0.5,
+                linewidth=0.2,
+            )
+            plt.legend()
+            plt.yscale("log")
+            plt.xlabel(x_label)
+            plt.ylabel("Frequency")
 
-                axs[idx].imshow(
-                    activations.squeeze(1).numpy(),
-                    cmap=cmap,
-                    interpolation="nearest",
-                    vmin=-3,
-                    vmax=+3,
-                )
-                max_value = torch.max(tensor)
-                min_value = torch.min(tensor)
-                # Include the threshold values in the plot, as well as the highest and lowest activation values
-                name = suffix if idx == 1 else "Attn o_proj"
-                axs[idx].text(
-                    115,
-                    7.5,
-                    f"Low 1%: {threshold_low:.2f}\nTop 1%: {threshold_high:.2f}\nMin: {min_value:.2f}\nMax: {max_value:.2f}",
-                    fontsize=5,
-                )
-                axs[idx].text(
-                    0,
-                    2,
-                    f"{name}",
-                    fontsize=8,
-                )
-                axs[idx].tick_params(axis="both", which="major", labelsize=7)
-                axs[idx].set_aspect("equal")
-
-            axs[0].set_title(f"{output_dict[folder]} - {language_dict[file_name]}")
-            axs[0].set(ylabel=f"Layer")
-            axs[1].set(ylabel="Layer", xlabel="Hidden Dimension")
-
-            x_ticks_displayed = [0, 16, 32, 48, 64, 80, 96, 112, 128]
-            x_ticks_actual = [0, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096]
-
-            axs[0].set_xticks(x_ticks_displayed, x_ticks_actual)
-            axs[1].set_xticks(x_ticks_displayed, x_ticks_actual)
-
-            fig.subplots_adjust(wspace=0, hspace=0)
-            plt.tight_layout()
-
-            canvas = fig.canvas
-            canvas.draw()
-            width, height = fig.get_size_inches() * fig.get_dpi()
-            img_flat = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-            img = img_flat.reshape(int(height), int(width), 3)
-
-            # Remove from img the rows from 482 to 700 using indexing numpy
-            img = np.delete(img, np.s_[1020:1286], axis=0)
-            img = np.delete(img, np.s_[:110], axis=0)
-            img = np.delete(img, np.s_[-110:], axis=0)
-            img = np.delete(img, np.s_[:70], axis=1)
-            img = np.delete(img, np.s_[-60:], axis=1)
-
-            im = Image.fromarray(img)
-            im.save(f"{file_name}_{output_dict[folder]}.jpg")
-
+            # Save figure to the out_folder
+            out_filename = f"{lang_code}_{suffix}_hist.png"
+            out_path = os.path.join(out_folder, out_filename)
+            plt.savefig(out_path)
             plt.close()
+
+        print(f"Done processing folder '{folder}'. Results saved to '{out_folder}'.")
 
 
 if __name__ == "__main__":

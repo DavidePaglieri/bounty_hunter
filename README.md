@@ -1,17 +1,14 @@
 To run:
 
-# Download models from huggingface, and export model directory
-```
-export MODEL_PATH=/scratch0/davide/llama-2-7b-hf
-```
-
 # Run to save model activations
 ```
-python3 bounty_hunter.py $MODEL_PATH
+python3 bounty_hunter.py <model/huggingface/id/or/local/path>
 ```
+
+This will create a output folder with save tensors of the model, using different languages.
 
 # Plot
 ```
-python3 combined_plot.py
-python3 hist.py
+python3 plot_outliers.py <model/output/tensors/path>
+python3 hist.py <model/output/tensors/path>
 ```
