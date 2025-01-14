@@ -1,11 +1,6 @@
 To run:
 
-Download models from huggingface
-
-```
-cd bounty_hunter
-```
-# Export model directory
+# Download models from huggingface, and export model directory
 ```
 export MODEL_PATH=/scratch0/davide/llama-2-7b-hf
 ```
